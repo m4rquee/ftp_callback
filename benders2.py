@@ -1,6 +1,7 @@
 # %%
 import random
 import networkx as nx
+from matplotlib import pyplot as plt
 
 from math import log2, sqrt, ceil
 
@@ -70,12 +71,17 @@ for i, j, D in DG.edges(data=True):
     (x2, y2) = pos[j]
     D['w'] = dist(x1, y1, x2, y2)
 
+root_dist = {}
+rootx, rooty = pos[r]
+for i, (x, y) in pos.items():
+    root_dist[i] = dist(x, y, rootx, rooty)
+
 max_edge = max(d['w'] for u, v, d in DG.edges(data=True))
 M = ceil(log2(DG.number_of_nodes())) * max_edge
 
 # Warm start:
 greedy_edges, greedy_makespan = greedy_solution(r, DG.nodes, lambda u, v: DG.edges[u, v]['w'])
-M = max(M, greedy_makespan)
+M = min(M, greedy_makespan)
 
 # %%
 import gurobipy as gp
@@ -108,7 +114,7 @@ model.addConstr(gp.quicksum(x[r, j] for j in DG.successors(r)) == 1)
 model.addConstrs(gp.quicksum(x[i, j] for j in DG.successors(i)) <= 2 for i in DG.nodes if i != r)
 
 # The solution is a tree:
-model.addConstr(gp.quicksum(x) == n - 1, name='total_edges')
+model.addConstr(x.sum() == n - 1, name='total_edges')
 
 # For each arc pair use at most one arc:
 for i, j in DG.edges:
@@ -117,11 +123,9 @@ for i, j in DG.edges:
 model.update()
 # %%
 # Add depth variable modeling:
-print(f'Maximum depth = {M:.3f}')
 d = model.addVars(DG.nodes, lb=0, ub=M, name='d', vtype=GRB.CONTINUOUS)
 model.update()
 
-d[r] = 0  # fix the root's depth
 for j in DG.nodes:
     if j == r: continue
     for i in DG.predecessors(j):
@@ -132,6 +136,9 @@ for j in DG.nodes:
 for _, depth in d.items():
     model.addConstr(D >= depth)
 
+for i, depth in d.items():
+    depth.LB = root_dist[i]
+
 
 # %%
 def subtour_cb(x_val, adder, target=None):
@@ -139,51 +146,19 @@ def subtour_cb(x_val, adder, target=None):
     G = nx.Graph()
     for i, j in DG.edges:
         if x_val[i, j] > EPS:
-            G.add_edge(i, j, capacity=x_val[i, j])
+            G.add_edge(i, j)
 
-    # Compute Gomory-Hu tree:
-    added = 0
-    if len(G.nodes) > 0:
-        gh_tree = nx.gomory_hu_tree(G, capacity='capacity')
-
-        # Check all cuts in the Gomory-Hu tree
-        for u, v, w in gh_tree.edges(data='weight'):
-            if w > CUT_THRESHOLD: continue
-
-            # Remove the edge to get a cut
-            gh_copy = gh_tree.copy()
-            gh_copy.remove_edge(u, v)
-
-            # Get the two components:
-            components = list(nx.connected_components(gh_copy))
-
-            # Check if the cut is violated:
-            S = components[0] if r in components[0] else components[1]
-            if target is not None and target in S: continue
-
-            # Add lazy constraint: sum of edges internal to S <= |S| - 1
-            for comp in components:
-                internal_edges = []
-                cost = 0
-                for i, j in G.subgraph(comp).edges:
-                    internal_edges.append(x[i, j])
-                    cost += x_val[i, j]
-
-                if cost > len(comp) - 1:
-                    adder(gp.quicksum(internal_edges) <= len(comp) - 1)
-                    added += 1
-
-            # Add lazy constraint: sum of edges leaving S >= 1
-            cut_edges = []
-            for i in S:
-                for j in DG.successors(i):
-                    if j not in S:
-                        cut_edges.append(x[i, j])
-
-            if len(cut_edges) > 0:
-                adder(gp.quicksum(cut_edges) >= 1)
-                added += 1
-    return added
+    components = list(nx.connected_components(G))
+    if len(components) <= 1: return 0
+    for comp in components:
+        internal_edges = []
+        cost = 0
+        for i, j in G.subgraph(comp).edges:
+            internal_edges.append(x[i, j])
+            internal_edges.append(x[j, i])
+            cost += x_val[i, j] + x_val[j, i]
+        if cost > len(comp) - 1 + EPS:
+            adder(gp.quicksum(internal_edges) <= len(comp) - 1)
 
 
 # %%
@@ -201,8 +176,7 @@ def cb(m, where):
     # Get current solution:
     x_val = {e: getval(x_e) for e, x_e in x.items()}
 
-    added = subtour_cb(x_val, adder)
-    # if added: print(f'\t- Added {added} sub-tour constrains;')
+    subtour_cb(x_val, adder)
 
 
 # %%
@@ -223,7 +197,7 @@ for i, j in DG.edges:
 D.Start = greedy_makespan
 
 model.Params.LazyConstraints = 1
-model.Params.TimeLimit = 300
+model.Params.TimeLimit = 600
 model.optimize(cb)
 # %%
 # Visualize the solution:
@@ -231,5 +205,6 @@ sol_x = model.getAttr('x', x)
 sol_edges = [e for e in DG.edges if sol_x[e] > 1.0 - EPS]
 node_colors = ['green' if i == r else 'gray' for i in DG.nodes]
 nx.draw(DG.edge_subgraph(sol_edges), pos=pos, with_labels=True, node_color=node_colors)
+plt.show()
 
 print(f'Makespan = {model.objVal:.3f}')

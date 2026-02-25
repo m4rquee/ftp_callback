@@ -1,10 +1,10 @@
 # %%
-import random
 import networkx as nx
 import matplotlib.colors as mcolors
 from matplotlib import pyplot as plt
 
-from math import log2, sqrt, ceil
+import random
+from math import sqrt
 
 # Hyperparameters:
 EPS = 1e-2
@@ -71,9 +71,6 @@ for i, j, D in G.edges(data=True):
     (x1, y1) = pos[i]
     (x2, y2) = pos[j]
     D['w'] = dist(x1, y1, x2, y2)
-
-max_edge = max(d['w'] for u, v, d in G.edges(data=True))
-M = ceil(log2(G.number_of_nodes())) * max_edge
 
 # Warm start:
 greedy_edges, greedy_makespan = greedy_solution(r, G.nodes, lambda u, v: G.edges[u, v]['w'])
@@ -222,10 +219,8 @@ def cb(m, where):
     x_val = {e: getval(x_e) for e, x_e in x.items()}
     f_val = {e_k: getval(f_e_k) for e_k, f_e_k in f.items()}
 
-    added = subtour_cb(x, x_val, adder)
-    # if added: print(f'\t- Added {added} tree sub-tour constrains;')
-    added = path_cb(f_val, adder)
-    # if added: print(f'\t- Added {added} path sub-tour constrains;')
+    subtour_cb(x, x_val, adder)
+    path_cb(f_val, adder)
 
 
 # %%
