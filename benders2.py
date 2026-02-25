@@ -1,14 +1,12 @@
 # %%
 import random
 import networkx as nx
-import matplotlib.colors as mcolors
-from matplotlib import pyplot as plt
 
 from math import log2, sqrt, ceil
 
 # Hyperparameters:
 EPS = 1e-2
-CUT_THRESHOLD = 1.0 - EPS
+CUT_THRESHOLD = 0.3 - EPS
 random.seed(42)
 
 
@@ -65,18 +63,19 @@ def greedy_solution(source, nodes, space):
 # Create a random graph and visualize it:
 n = 30
 r = 0  # the root node
-G = nx.complete_graph(n)
+DG = nx.complete_graph(n, nx.DiGraph)
 pos = {i: (random.random(), random.random()) for i in list(range(n))}
-for i, j, D in G.edges(data=True):
+for i, j, D in DG.edges(data=True):
     (x1, y1) = pos[i]
     (x2, y2) = pos[j]
     D['w'] = dist(x1, y1, x2, y2)
 
-max_edge = max(d['w'] for u, v, d in G.edges(data=True))
-M = ceil(log2(G.number_of_nodes())) * max_edge
+max_edge = max(d['w'] for u, v, d in DG.edges(data=True))
+M = ceil(log2(DG.number_of_nodes())) * max_edge
 
 # Warm start:
-greedy_edges, greedy_makespan = greedy_solution(r, G.nodes, lambda u, v: G.edges[u, v]['w'])
+greedy_edges, greedy_makespan = greedy_solution(r, DG.nodes, lambda u, v: DG.edges[u, v]['w'])
+M = max(M, greedy_makespan)
 
 # %%
 import gurobipy as gp
@@ -87,71 +86,65 @@ model = gp.Model()
 # model.Params.OutputFlag = 0
 
 # Edge usage variables:
-x = model.addVars(G.edges, name='x', vtype=GRB.BINARY)
-for i, j in G.edges: x[j, i] = x[i, j]
+x = model.addVars(DG.edges, name='x', vtype=GRB.BINARY)
 
 # Depth variable:
-d = model.addVar(lb=0, ub=greedy_makespan, name='d', vtype=GRB.CONTINUOUS)
+D = model.addVar(lb=0, ub=M, vtype=GRB.CONTINUOUS)
 model.update()
 
 # Objective function:
-model.setObjective(d, GRB.MINIMIZE)
+model.setObjective(D, GRB.MINIMIZE)
 
-# Each node (besides r) should have a degree at most three:
-model.addConstrs((gp.quicksum(x[i, j] for j in G.neighbors(i)) <= 3 for i in G.nodes if i != r), name='internal_d')
+# Each node (besides r) should have one incoming arc:
+model.addConstrs(gp.quicksum(x[j, i] for j in DG.predecessors(i)) == 1 for i in DG.nodes if i != r)
 
-# The root has degree one:
-model.addConstr(gp.quicksum(x[r, j] for j in G.neighbors(r)) == 1, name='root_d')
+# No incoming arc for the root:
+model.addConstr(gp.quicksum(x[j, r] for j in DG.predecessors(r)) == 0)
+
+# The root has out-degree one:
+model.addConstr(gp.quicksum(x[r, j] for j in DG.successors(r)) == 1)
+
+# Each node (besides r) should have at most two outgoing arcs:
+model.addConstrs(gp.quicksum(x[i, j] for j in DG.successors(i)) <= 2 for i in DG.nodes if i != r)
 
 # The solution is a tree:
-model.addConstr(gp.quicksum(x[i, j] for i, j in G.edges) == n - 1, name='total_edges')
+model.addConstr(gp.quicksum(x) == n - 1, name='total_edges')
+
+# For each arc pair use at most one arc:
+for i, j in DG.edges:
+    model.addConstr(x[i, j] + x[j, i] <= 1)
 
 model.update()
 # %%
-# Add path cover modeling:
-f = model.addVars(G.edges, G.nodes, name='f', vtype=GRB.BINARY)
-fk = {k: {(i, j): f[i, j, k] for i, j in G.edges} for k in G.nodes}
-for i, j in G.edges:
-    for k in G.nodes:
-        f[j, i, k] = f[i, j, k]
-        fk[k][j, i] = fk[k][i, j]
+# Add depth variable modeling:
+print(f'Maximum depth = {M:.3f}')
+d = model.addVars(DG.nodes, lb=0, ub=M, name='d', vtype=GRB.CONTINUOUS)
 model.update()
 
-# Path usage constraints:
-for i, j in G.edges:
-    for k in G.nodes:
-        model.addConstr(f[i, j, k] <= x[i, j])
+d[r] = 0  # fix the root's depth
+for j in DG.nodes:
+    if j == r: continue
+    for i in DG.predecessors(j):
+        # A node's depth is at least the depth of its predecessor plus the distance between them:
+        model.addConstr(d[j] >= d[i] + DG.edges[i, j]['w'] * x[i, j] + M * (x[i, j] - 1))
 
-# Path degree constraints:
-for k in G.nodes:
-    if k == r: continue
-
-    # Each path should start at the root and end at its target k:
-    model.addConstr(gp.quicksum(f[r, i, k] for i in G.neighbors(r)) == 1)
-    model.addConstr(gp.quicksum(f[k, i, k] for i in G.neighbors(k)) == 1)
-    for i in G.nodes:
-        if i == r or i == k: continue
-        model.addConstr(gp.quicksum(f[i, j, k] for j in G.neighbors(i)) <= 2)
-    model.addConstr(gp.quicksum(f[i, j, k] for i, j in G.edges) <= n - 1)
-
-# Paths to depth connection constraints:
-for k in G.nodes:
-    if k == r: continue
-    model.addConstr(d >= gp.quicksum(f[i, j, k] * G.edges[i, j]['w'] for i, j in G.edges))
+# The tree depth is the maximum over all depths:
+for _, depth in d.items():
+    model.addConstr(D >= depth)
 
 
 # %%
-def subtour_cb(x_var, x_val, adder, target=None):
+def subtour_cb(x_val, adder, target=None):
     # Build an undirected graph with selected edges:
-    subG = nx.Graph()
-    for i, j in G.edges:
+    G = nx.Graph()
+    for i, j in DG.edges:
         if x_val[i, j] > EPS:
-            subG.add_edge(i, j, capacity=x_val[i, j])
+            G.add_edge(i, j, capacity=x_val[i, j])
 
     # Compute Gomory-Hu tree:
     added = 0
-    if len(subG.nodes) > 0:
-        gh_tree = nx.gomory_hu_tree(subG, capacity='capacity')
+    if len(G.nodes) > 0:
+        gh_tree = nx.gomory_hu_tree(G, capacity='capacity')
 
         # Check all cuts in the Gomory-Hu tree
         for u, v, w in gh_tree.edges(data='weight'):
@@ -168,41 +161,28 @@ def subtour_cb(x_var, x_val, adder, target=None):
             S = components[0] if r in components[0] else components[1]
             if target is not None and target in S: continue
 
-            work = 0
+            # Add lazy constraint: sum of edges internal to S <= |S| - 1
             for comp in components:
                 internal_edges = []
                 cost = 0
                 for i, j in G.subgraph(comp).edges:
-                    internal_edges.append(x_var[i, j])
+                    internal_edges.append(x[i, j])
                     cost += x_val[i, j]
-                work += cost > len(comp) - 1
 
                 if cost > len(comp) - 1:
                     adder(gp.quicksum(internal_edges) <= len(comp) - 1)
                     added += 1
 
-            # if work > 0: continue
-
             # Add lazy constraint: sum of edges leaving S >= 1
             cut_edges = []
             for i in S:
-                for j in G.neighbors(i):
+                for j in DG.successors(i):
                     if j not in S:
-                        cut_edges.append(x_var[i, j])
+                        cut_edges.append(x[i, j])
 
             if len(cut_edges) > 0:
                 adder(gp.quicksum(cut_edges) >= 1)
                 added += 1
-    return added
-
-
-# %%
-def path_cb(f_val, adder):
-    added = 0
-    for k in G.nodes:
-        if k == r: continue
-        x_val = {(i, j): f_e_k for (i, j, l), f_e_k in f_val.items() if l == k}
-        added += subtour_cb(fk[k], x_val, adder, target=k)
     return added
 
 
@@ -220,62 +200,36 @@ def cb(m, where):
     adder = m.cbCut if where == GRB.Callback.MIPNODE else m.cbLazy
     # Get current solution:
     x_val = {e: getval(x_e) for e, x_e in x.items()}
-    f_val = {e_k: getval(f_e_k) for e_k, f_e_k in f.items()}
 
-    added = subtour_cb(x, x_val, adder)
-    # if added: print(f'\t- Added {added} tree sub-tour constrains;')
-    added = path_cb(f_val, adder)
-    # if added: print(f'\t- Added {added} path sub-tour constrains;')
+    added = subtour_cb(x_val, adder)
+    # if added: print(f'\t- Added {added} sub-tour constrains;')
 
 
 # %%
 # Model solving:
 model.update()
 
+# Warm start:
+greedy_edges, greedy_makespan = greedy_solution(r, DG.nodes, lambda u, v: DG.edges[u, v]['w'])
+
 # Set x variables:
-for i, j in G.edges:
-    if (i, j) in greedy_edges or (j, i) in greedy_edges:
+for i, j in DG.edges:
+    if (i, j) in greedy_edges:
         x[i, j].Start = 1
     else:
         x[i, j].Start = 0
-# Set d variable:
-d.Start = greedy_makespan
 
-# Set f variables:
-tree = nx.Graph(greedy_edges)
-for k in G.nodes:
-    if k == r: continue
-    path = nx.shortest_path(tree, r, k)
-    path_edges = set(zip(path, path[1:]))
-    for i, j in G.edges:
-        if (i, j) in path_edges or (j, i) in path_edges:
-            f[i, j, k].Start = 1
-        else:
-            f[i, j, k].Start = 0
+# Set d variable:
+D.Start = greedy_makespan
 
 model.Params.LazyConstraints = 1
+model.Params.TimeLimit = 300
 model.optimize(cb)
 # %%
 # Visualize the solution:
 sol_x = model.getAttr('x', x)
-sol_f = model.getAttr('x', f)
-sol_edges = [e for e in G.edges if sol_x[e] > 1.0 - EPS]
-node_colors = []
-colors = list(mcolors.BASE_COLORS)
-if n <= 10:
-    for k in G.nodes:
-        if k == r:
-            node_colors.append('gray')
-            continue
-        curr_color = colors[k % len(colors)]
-        node_colors.append(curr_color)
-        path = [(i, j) for i, j in G.edges if sol_f[i, j, k] > 1.0 - EPS]
-        nx.draw_networkx_edges(G, pos=pos, edgelist=path, edge_color=curr_color, style='dashed',
-                               connectionstyle=f'arc3,rad={(k + 1) * 0.1}', arrows=True)
-else:
-    node_colors = ['green' if i == r else 'gray' for i in G.nodes]
-edge_color = ['black' if e in sol_edges else 'white' for e in G.edges]
-nx.draw(G, pos=pos, with_labels=True, node_color=node_colors, edge_color=edge_color)
-plt.show()
+sol_edges = [e for e in DG.edges if sol_x[e] > 1.0 - EPS]
+node_colors = ['green' if i == r else 'gray' for i in DG.nodes]
+nx.draw(DG.edge_subgraph(sol_edges), pos=pos, with_labels=True, node_color=node_colors)
 
 print(f'Makespan = {model.objVal:.3f}')
